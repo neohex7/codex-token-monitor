@@ -1,5 +1,6 @@
 import unittest
-from codex_token_monitor.ui import _Dashboard
+from codex_token_monitor.ui import _Dashboard, _cost_breakdown
+from codex_token_monitor.pricing import price_call, combine_costs, unavailable
 
 
 class Screen:
@@ -56,6 +57,33 @@ class UITests(unittest.TestCase):
         text='\n'.join(screen.writes)
         self.assertIn('average OUTPUT 2.50 tok/s',text)
         self.assertIn('Model: gpt-6.1-sol',text)
+
+    def test_chat_and_turn_breakdown_include_agents_at_cached_rates(self):
+        screen,dashboard=self.dashboard()
+        root=price_call('gpt-6.1-sol', {'input_tokens':100000,
+            'cached_input_tokens':80000,'output_tokens':2000})
+        child=price_call('gpt-6-luna', {'input_tokens':100000,
+            'cached_input_tokens':80000,'output_tokens':2000})
+        combined=combine_costs([root,child])
+        costs=dict(api_cost=root,children_api_cost=child,api_cost_with_children=combined)
+        dashboard.data['selected'].update(costs)
+        dashboard.data['selected']['turns'][0].update(costs)
+        for draw in (dashboard.draw_main,dashboard.draw_detail):
+            screen.writes=[]
+            draw(3,41,0,156)
+            text='\n'.join(screen.writes)
+            self.assertIn('$0.071800',text)
+            self.assertIn('uncached $0.042000 · cache read $0.008800',text)
+            self.assertIn('cache write $0.000000 · output $0.021000',text)
+
+    def test_incomplete_breakdown_does_not_claim_exact_components(self):
+        cost=combine_costs([price_call('gpt-6.1-sol', {
+            'input_tokens':100000,'cached_input_tokens':80000,'output_tokens':2000}),
+            unavailable('Missing response')])
+        text='\n'.join(_cost_breakdown(cost))
+        self.assertIn('uncached >=$0.040000 · cache read >=$0.008000',text)
+        self.assertIn('cache write N/A · output >=$0.020000',text)
+        self.assertNotIn('$0.000000', '\n'.join(_cost_breakdown(None)))
 
 
 if __name__=='__main__':unittest.main()

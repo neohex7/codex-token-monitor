@@ -158,6 +158,25 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(first['api_cost']['calls'],2)
         self.assertEqual(Decimal(first['api_cost']['usd']),Decimal('.000294'))
 
+    def test_cached_prices_survive_flat_and_nested_records_and_dedup(self):
+        flat = modern(102000)
+        flat['payload']['usage'].update(input_tokens=100000, output_tokens=2000,
+                                      cached_input_tokens=80000)
+        nested = modern(102000, response='r2')
+        nested['payload']['usage'].update(input_tokens=100000, output_tokens=2000,
+            input_tokens_details={'cached_tokens':80000})
+        self.append(start(), event('turn_context', {'turn_id':'t1','model':'gpt-6.1-sol'}),
+                    flat, flat, nested)
+        turn = self.reader.public_turns(110)[0]
+        self.assertEqual(turn['tokens']['total_tokens'], 204000)
+        self.assertEqual(turn['tokens']['cached_input_tokens'], 160000)
+        self.assertEqual(turn['api_cost']['calls'], 2)
+        self.assertEqual(Decimal(turn['api_cost']['usd']), Decimal('.136'))
+        parts = turn['api_cost']['components_usd']
+        self.assertEqual(Decimal(parts['input']), Decimal('.08'))
+        self.assertEqual(Decimal(parts['cached_input']), Decimal('.016'))
+        self.assertEqual(Decimal(parts['output']), Decimal('.04'))
+
     def test_no_historical_model_is_inferred_from_a_later_turn(self):
         self.append(start(),modern(100),start('t2',110),
             event('turn_context',{'turn_id':'t2','model':'gpt-6.1-sol'},110),

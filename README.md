@@ -57,6 +57,7 @@ CODEX_MONITOR_PYTHON=/path/to/python3 ./start.sh
 - Chat input, output, cached input, and reasoning counters. **Cached input is included in input and total usage; reasoning is included in output.** These subsets are never added again or subtracted from total consumption.
 - The latest user turn, its status, and usage while work is in progress. Messages steering ongoing work remain in that turn.
 - Available turn history with times, status, model, token totals, average output tokens per second, estimated API token cost, and abbreviated prompts. Enter opens the full prompt, counter source, model details, and cost breakdown.
+- The header switches between the chat browser and a time view. Time view lists prompts across local Codex chats in chronological order with the chat title, recorded tokens, and estimated API token cost.
 - Current output speed, calculated as the change in reported output divided by elapsed time between samples. The first sample is `N/A`; no new tokens means zero. Average turn speed is output divided by the entire turn duration, including tools and waiting. Reported reasoning counts as output. Usage arrives in batches, so these figures are not pure model decoding speed. JSON also retains the current input-plus-output speed field.
 - An optional account limits panel showing usage windows, resets, source, and observation age. Task-level limit percentages are not inferred from token totals.
 - Separate available child-agent counters. They are not automatically added to the parent chat token total, because inherited fork history and different counter sources can overlap. Linked child-agent API estimates are shown separately and in combined cost figures.
@@ -65,6 +66,11 @@ CODEX_MONITOR_PYTHON=/path/to/python3 ./start.sh
 
 | Key | Action |
 | --- | --- |
+| `c` / `t` | Switch between Chat and Time views (also clickable in the header) |
+| `1` / `2` | Time view: Today or Last 24h |
+| `3` / `4` | Time view: Last 7 days or Last 30 days |
+| `5` | Time view: Since the current Codex weekly reset |
+| `6` | Edit a custom time range; click or Tab to switch fields, Enter advances/applies, Esc cancels |
 | Up / Down or `j` / `k` | Select a chat or turn |
 | Tab | Switch between chats and turn history |
 | Enter | Focus history or open turn details |
@@ -78,6 +84,8 @@ CODEX_MONITOR_PYTHON=/path/to/python3 ./start.sh
 | `q` | Exit |
 
 A manually selected chat stays selected until follow mode is enabled with `f`. Follow mode uses recorded local activity, not the focused desktop app window. Mouse selection works in terminals with `curses` mouse support. A 156 × 44 terminal is recommended; narrower terminals switch panels with Tab.
+
+Today runs from local midnight to now. Last 24h, Last 7d, and Last 30d roll back from now. Weekly Reset uses the current Codex weekly window's next reset minus the reported window length; it shows unavailable if no current window is known. Custom dates use local time in `YYYY-MM-DD HH:MM` format, with the start included and end excluded. Leave To blank to keep tracking through now. The time view groups by the first user message of each turn and sums the whole turns listed, including linked agents. A turn can finish after the selected range; a turn started before the range is excluded. This is usage attributed to prompts sent in the range, rather than a wall-clock breakdown of individual model calls. Missing or malformed candidate logs are reported, and partial prices show only the known subtotal. The first scan may take several seconds; navigation stays responsive and subsequent refreshes reuse parsed records.
 
 ## Data and accounting limits
 
@@ -100,6 +108,8 @@ The bundled rate table in `codex_token_monitor/pricing.py` is dated **2026-11-05
 The table covers GPT-6.1 Sol/Terra, GPT-6 Astra/Sol/Luna, GPT-5.6 Sol/Terra/Luna, and GPT-5.5, including dated identifiers for those models. Its GPT-5.6 Sol entry is marked as promotional through November 30. Unsupported models or incomplete records produce `N/A` or a known partial subtotal such as `>=$...`.
 
 Estimates are calculated per recorded model call before aggregation. Ordinary input, cache reads, cache writes, and output are priced separately. Reasoning is already part of output and is not charged again. Cache writes are removed from ordinary input and charged once: 1.25 times the input rate for 30 minutes or 2.5 times for 12 hours. Unspecified write lifetimes use the 30-minute default with a note; unverified GPT-5.5 cache-write pricing is unavailable. For each individual call above 272,000 input tokens, the bundled calculation applies twice the input/cache rate and 1.5 times the output rate. Several small calls do not become one long-context call.
+
+The dashboard shows separate dollar amounts for uncached input, cache reads, cache writes, and output directly below the combined chat estimate. Turn details and `--once` show the same breakdown for each turn, including linked agents. Uncached input is total input minus cache reads and cache writes; cached tokens remain in token totals. For example, one GPT-6.1 Sol call with 100,000 input tokens (80,000 cached) and 2,000 output tokens is estimated at $0.040 + $0.008 + $0.020 = $0.068 with the bundled rates. Partial component amounts use `>=` or `N/A`, just like partial totals.
 
 The turn cost column includes the parent turn and linked child agents. Details separate parent and child costs, models, and token categories. Chat estimates include available response records and recorded context compaction, so they can cover more tokens than the historical chat counter. Linked child records are not added twice. Missing calls or unlinked child usage make an estimate incomplete.
 

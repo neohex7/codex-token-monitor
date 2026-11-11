@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import sys
 from .telemetry import Monitor
-from .ui import _money
+from .ui import _money, _cost_breakdown
 
 
 def main():
@@ -64,11 +64,15 @@ def main():
                 print(f"Input: {selected['tokens']['input_tokens']:,} | cached subset: {selected['tokens']['cached_input_tokens']:,} | output: {selected['tokens']['output_tokens']:,}")
                 print(f"Child agents (separate DB counters): {selected['children_total']:,}")
                 print(f"API token estimate USD: root {_money(selected['api_cost'])} | agents {_money(selected['children_api_cost'])} | combined {_money(selected['api_cost_with_children'])}")
+                for line in _cost_breakdown(selected['api_cost_with_children']):
+                    print(line)
                 print(f"Standard API token rates checked {selected['api_cost']['rate_date']}; includes recorded compaction. Separate tool fees, service-tier and regional adjustments excluded.")
                 for turn in reversed(selected['turns'][-10:]):
                     average = f"{turn['avg_tps']:.2f}/s" if turn['avg_tps'] is not None else 'N/A'
                     print(f"{turn['status']:11} {turn['tokens']['total_tokens']:>13,} | {safe(turn['model'])} | avg output {average}")
                     print(f"  API {_money(turn['api_cost_with_children'])} (root {_money(turn['api_cost'])}, linked agents {_money(turn['children_api_cost'])}) | {safe(turn['prompt'])[:100]}")
+                    for line in _cost_breakdown(turn['api_cost_with_children']):
+                        print('  ' + line)
                 for warning in snapshot['warnings']+selected['warnings']:
                     print('Note: '+warning)
                 print('Token rates require two live samples. Counts arrive in reported batches, not each generated token.')

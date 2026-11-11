@@ -12,7 +12,12 @@ class PricingTests(unittest.TestCase):
             'total_tokens': 102000})
         # 20k * $2 + 80k * $.10 + 2k * $10, all per million.
         self.assertEqual(Decimal(cost['usd']), Decimal('.068'))
+        self.assertEqual(Decimal(cost['components_usd']['input']), Decimal('.04'))
+        self.assertEqual(Decimal(cost['components_usd']['cached_input']), Decimal('.008'))
         self.assertEqual(Decimal(cost['components_usd']['output']), Decimal('.02'))
+        uncached = price_call('gpt-6.1-sol', {
+            'input_tokens': 100000, 'cached_input_tokens': 0, 'output_tokens': 2000})
+        self.assertEqual(Decimal(uncached['usd']), Decimal('.22'))
 
     def test_price_tier_is_per_call_not_per_user_turn(self):
         small = price_call('gpt-6.1-sol', {'input_tokens': 200000,

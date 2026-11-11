@@ -72,11 +72,31 @@ def normalize_limit(raw, observed_at, source):
             'primary': window(raw.get('primary')), 'secondary': window(raw.get('secondary'))}
 
 
+def weekly_cycle_start(limits, now):
+    """Use the active standard Codex window, not the first observed 0% reading."""
+    for limit in limits:
+        if limit['id'] != 'codex':
+            continue
+        observed = timestamp(limit.get('observed_at'))
+        for key in ('primary', 'secondary'):
+            window = limit.get(key)
+            if not window or window.get('window_minutes') != 7 * 24 * 60:
+                continue
+            reset = timestamp(window.get('resets_at'))
+            if reset is None or observed is None:
+                continue
+            start = reset - 7 * 86400
+            if start <= now < reset and start <= observed < reset:
+                return start
+    return None
+
+
 class Rollout:
     """Incremental binary reader: incomplete final lines are retried, never consumed."""
 
-    def __init__(self, path):
+    def __init__(self, path, thread_id=None):
         self.path = Path(path)
+        self.thread_id = thread_id
         self.offset = 0
         self.identity = None
         self.legacy_total = usage()
@@ -121,7 +141,7 @@ class Rollout:
             self.current['status'] = 'unknown'
             self.current['ended_at'] = at
         turn = {'id': turn_id or f'legacy:{len(self.turns)+1}', 'prompt': '',
-                'started_at': at, 'ended_at': None, 'status': 'active',
+                'started_at': at, 'prompt_at': None, 'ended_at': None, 'status': 'active',
                 'tokens': usage(), 'avg_tps': None, 'limit_deltas': [], '_legacy_observed': False,
                 '_limit_start': dict(self.limits), 'root_turn_id': None,
                 '_active_model': None, '_api_costs': [], '_models': []}
@@ -136,6 +156,8 @@ class Rollout:
         turn = self.current
         if not turn or turn['status'] != 'active':
             turn = self.start(None, at, explicit=False)
+        if turn['prompt_at'] is None:
+            turn['prompt_at'] = at
         # Some versions write the same message as both response_item and event_msg.
         if text not in turn['prompt'].split('\n\n---\n\n'):
             turn['prompt'] = (turn['prompt'] + '\n\n---\n\n' + text).strip('\n- ')
@@ -214,7 +236,7 @@ class Rollout:
                 cost = unavailable('Response has no recorded turn boundary/model.')
                 self.orphan_costs.append(cost)
             root_id = payload.get('root_turn_id')
-            if root_id:
+            if root_id and (not self.thread_id or payload.get('thread_id') in (None, self.thread_id)):
                 root_usage = self.root_usage.setdefault(root_id, usage())
                 for k, v in usage(payload.get('usage')).items():
                     root_usage[k] += v
@@ -259,7 +281,7 @@ class Rollout:
             identity = (stat.st_dev, stat.st_ino)
             if self.identity is not None and (identity != self.identity or stat.st_size < self.offset):
                 path = self.path
-                self.__init__(path)
+                self.__init__(path, self.thread_id)
                 self.warn('Rollout replaced/truncated; rebuilt from the available history.')
             self.identity = identity
             if self.last_stat == (stat.st_size, stat.st_mtime_ns):
@@ -283,9 +305,11 @@ class Rollout:
         if self.bad_lines:
             self.warn(f'Skipped malformed records: {self.bad_lines}. History may be incomplete.')
 
-    def public_turns(self, now):
+    def public_turns(self, now, include=None):
         result = []
         for turn in self.turns:
+            if include is not None and not include(turn):
+                continue
             item = {k: v for k, v in turn.items() if not k.startswith('_')}
             # The newer format records actual response usage with explicit turn IDs.
             # Its cumulative base can differ from the older chat counter.
@@ -398,9 +422,99 @@ class Monitor:
     def parser(self, row):
         key = row['id']
         if key not in self.parsers or self.parsers[key].path != Path(row['rollout_path']):
-            self.parsers[key] = Rollout(row['rollout_path'])
+            self.parsers[key] = Rollout(row['rollout_path'], key)
         self.parsers[key].refresh()
         return self.parsers[key]
+
+    def period_snapshot(self, start, end):
+        """Group turns in [start, end); None starts at the current weekly boundary."""
+        now = time.time()
+        rows = {row['id']: row for row in self.read_threads()}
+        if start is None:
+            start = weekly_cycle_start(self.recent_limits(list(rows.values())), end)
+            if start is None:
+                warning = 'Current Codex weekly reset time is unavailable.'
+                return {'updated_at':now, 'start':None, 'end':end, 'turns':[], 'tokens':None,
+                        'api_cost':unavailable(warning), 'warnings':[warning, *self.warnings]}
+        warnings = list(self.warnings)
+        gaps = set()
+        by_chat = {}
+        seen_turn_ids = set()
+
+        def candidate(row):
+            updated = row['updated_at']
+            try:
+                return not updated or max(updated, Path(row['rollout_path']).stat().st_mtime) >= start
+            except OSError:
+                return not updated or updated >= start
+
+        def in_period(turn):
+            at = turn['prompt_at'] if turn['prompt_at'] is not None else turn['started_at']
+            return bool(turn['prompt'] and at is not None and start <= at < end)
+
+        roots = [(row, self.parser(row)) for row in rows.values()
+                 if not row['is_agent'] and candidate(row)]
+        roots.sort(key=lambda pair: bool(pair[1].meta.get('forked_from_id')))
+        for row, parser in roots:
+            forked = bool(parser.meta.get('forked_from_id'))
+            fork_at = timestamp(parser.meta.get('timestamp')) if forked else None
+            if parser.last_stat is None or parser.bad_lines or (forked and fork_at is None):
+                gaps.add(row['id'])
+            if forked and fork_at is None:
+                continue
+            for turn in parser.public_turns(now, include=in_period):
+                at = turn['prompt_at'] if turn['prompt_at'] is not None else turn['started_at']
+                explicit = not turn['id'].startswith('legacy:')
+                if (fork_at is not None and at < fork_at) or (explicit and turn['id'] in seen_turn_ids):
+                    continue
+                if explicit:
+                    seen_turn_ids.add(turn['id'])
+                turn.update(thread_id=row['id'], chat_title=row['title'], prompt_at=at,
+                            children_tokens=usage(), period_child_costs=[])
+                by_chat.setdefault(row['id'], {})[turn['id']] = turn
+
+        for row in rows.values():
+            if not row['is_agent'] or not candidate(row):
+                continue
+            ancestor = row
+            visited = {row['id']}
+            while ancestor.get('parent_id') in rows and ancestor['parent_id'] not in visited:
+                ancestor = rows[ancestor['parent_id']]
+                visited.add(ancestor['id'])
+            turns = by_chat.get(ancestor['id'])
+            if not turns:
+                if ancestor['is_agent'] and row['tokens']['total_tokens']:
+                    gaps.add(row['id'])
+                continue
+            parser = self.parser(row)
+            linked = parser.root_usage
+            if (parser.last_stat is None or parser.bad_lines
+                    or sum(t['total_tokens'] for t in linked.values()) != parser.own_records['total_tokens']
+                    or (parser.legacy_seen and not parser.modern_records and parser.total['total_tokens'])):
+                gaps.add(row['id'])
+            for turn_id in linked.keys() & turns.keys():
+                turn = turns[turn_id]
+                for key, value in linked[turn_id].items():
+                    turn['children_tokens'][key] += value
+                turn['period_child_costs'].extend(parser.root_costs[turn_id])
+
+        turns = sorted((t for chat in by_chat.values() for t in chat.values()),
+                       key=lambda t: (t['prompt_at'], t['thread_id'], t['id']))
+        totals = usage()
+        costs = []
+        for turn in turns:
+            turn['children_api_cost'] = combine_costs(turn.pop('period_child_costs'))
+            turn['api_cost_with_children'] = combine_costs([turn['api_cost'], turn['children_api_cost']])
+            turn['period_tokens'] = {k: turn['tokens'][k] + turn['children_tokens'][k] for k in FIELDS}
+            for k, value in turn['period_tokens'].items():
+                totals[k] += value
+            costs.append(turn['api_cost_with_children'])
+        if gaps:
+            warning = f'{len(gaps)} candidate rollouts missing, malformed or unlinked; period coverage may be incomplete.'
+            warnings.append(warning)
+            costs.append(unavailable(warning))
+        return {'updated_at':time.time(), 'warnings':warnings, 'turns':turns,
+                'start':start, 'end':end, 'tokens':totals, 'api_cost':combine_costs(costs)}
 
     def recent_limits(self, rows):
         # Read only bounded tails of recently updated rollouts; never rescan whole archives.

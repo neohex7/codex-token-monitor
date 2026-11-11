@@ -9,6 +9,7 @@ import unicodedata
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from typing import Any
+from .period_ui import PERIOD_LABELS, PeriodView
 
 def _clean(value: Any) -> str:
     """Prevent data from becoming terminal controls, including bidi controls."""
@@ -58,6 +59,18 @@ def _money(cost: Any) -> str:
     except (ValueError, TypeError, InvalidOperation):
         return 'N/A'
 
+def _cost_breakdown(cost: Any) -> list[str]:
+    """Use the same scope and completeness as the displayed total."""
+    cost = cost or {}
+    parts = cost.get('components_usd') or {}
+    def component(key):
+        if key not in parts:
+            return 'N/A'
+        return _money({'complete': cost.get('complete', False),
+                       'usd': parts[key], 'known_usd': parts[key]})
+    return [f"USD: uncached {component('input')} · cache read {component('cached_input')}",
+            f"USD: cache write {component('cache_write')} · output {component('output')}"]
+
 def _date(value: Any) -> str:
     try:
         return datetime.fromtimestamp(float(value)).strftime('%d %b %H:%M')
@@ -96,7 +109,7 @@ def _wrap(value: Any, width: int) -> list[str]:
         lines.append(current)
     return lines or ['(No prompt recorded)']
 
-class _Dashboard:
+class _Dashboard(PeriodView):
 
     def __init__(self, screen: Any, monitor: Any, selected: str | None, refresh: float, decimals: int):
         self.screen = screen
@@ -128,6 +141,7 @@ class _Dashboard:
         self._worker = None
         self._loading = False
         self._view_cache = {}
+        self.init_period()
 
     def put(self, y: int, x: int, text: Any, attr: int=0, width: int | None=None) -> None:
         height, columns = self.screen.getmaxyx()
@@ -167,17 +181,23 @@ class _Dashboard:
             pass
 
     def request_key(self):
+        if self.mode == 'time':
+            return ('time', self.period_preset, self.custom_period)
         return (None if self.follow else self.selected, self.include_agents, self.query, self.follow)
 
     def fetch(self) -> None:
         if self._worker is not None:
             return
         request = self.request_key()
+        is_time = self.mode == 'time'
         self._loading = True
         self.next_refresh = time.monotonic() + self.refresh
         def load():
             try:
-                data = self.monitor.snapshot(selected_id=request[0], include_agents=request[1], query=request[2])
+                if is_time:
+                    data = self.monitor.period_snapshot(*self.period_bounds(request, time.time()))
+                else:
+                    data = self.monitor.snapshot(selected_id=request[0], include_agents=request[1], query=request[2])
                 self._results.put((request, data, None))
             except Exception as exc:
                 self._results.put((request, None, str(exc)))
@@ -203,36 +223,58 @@ class _Dashboard:
         if error:
             self.error = 'Refresh failed: ' + _clean(error)
             return
-        threads = list(data.get('threads') or [])
-        returned = data.get('selected') or {}
-        if returned.get('id') != self.selected:
-            self.selected = returned.get('id')
-            self.turn_index = self.turn_offset = 0
-            self.turn_id = None
-            self.detail = False
+        if self.mode == 'chat':
+            self.threads = list(data.get('threads') or [])
+            returned = data.get('selected') or {}
+            if returned.get('id') != self.selected:
+                self.selected = returned.get('id')
+                self.turn_index = self.turn_offset = 0
+                self.turn_id = None
+                self.detail = False
         self.data = data
-        self.threads = threads
         turns = self.turns()
         if self.turn_id is not None:
-            self.turn_index = next((i for i, turn in enumerate(turns) if turn.get('id') == self.turn_id), min(self.turn_index, max(0, len(turns)-1)))
+            index = next((i for i, turn in enumerate(turns) if self.turn_key(turn) == self.turn_id), None)
+            if index is None:
+                self.detail = False
+            else:
+                self.turn_index = index
         self.turn_index = min(self.turn_index, max(0, len(turns)-1))
         if turns:
-            self.turn_id = turns[self.turn_index].get('id')
+            self.turn_id = self.turn_key(turns[self.turn_index])
         self.error = ''
         self.next_refresh = time.monotonic() + self.refresh
 
     def turns(self) -> list[dict[str, Any]]:
+        if self.mode == 'time':
+            return self.data.get('turns') or []
         return list(reversed((self.data.get('selected') or {}).get('turns') or []))
+
+    def turn_key(self, turn):
+        return (turn['thread_id'], turn['id']) if self.mode == 'time' else turn.get('id')
 
     def draw(self, loading: bool=False) -> None:
         self.screen.erase()
         height, width = self.screen.getmaxyx()
         accent = self.color(1) | curses.A_BOLD
         self.put(0, 1, 'CODEX / TOKEN MONITOR', accent)
-        self.put(1, 1, f"Local usage · every {self.refresh:g}s · {('FOLLOW latest' if self.follow else 'MANUAL selection')} · {('Loading…' if loading else _age(self.data.get('updated_at')))}", curses.A_DIM)
+        view = ('FOLLOW latest' if self.follow else 'MANUAL selection') if self.mode == 'chat' else 'TIME range'
+        self.put(1, 1, f"Local usage · every {self.refresh:g}s · {view} · {('Loading…' if loading else _age(self.data.get('updated_at')))}", curses.A_DIM)
+        top = 3
+        for y, x, _, tab, selected in self.view_tabs(width):
+            self.put(y, x, tab, curses.A_REVERSE if selected else accent)
+            top = y + 1
         if height < 15 or width < 58:
             self.put(4, 2, 'Please enlarge the terminal (58 columns × 15 rows).', accent)
             self.put(6, 2, 'Tab panel · q quit · r refresh')
+            self.screen.refresh()
+            return
+        if self.range_fields is not None:
+            self.draw_range_editor()
+            self.screen.refresh()
+            return
+        if self.mode == 'time':
+            self.draw_period(height, width, top)
             self.screen.refresh()
             return
         split = width >= 100
@@ -242,12 +284,12 @@ class _Dashboard:
         main_width = width - main_x
         bottom = height - 3
         if show_chats:
-            self.draw_chats(3, bottom, left_width)
+            self.draw_chats(top, bottom, left_width)
         if split:
-            for row in range(3, bottom):
+            for row in range(top, bottom):
                 self.put(row, left_width, '│', curses.A_DIM)
         if split or not show_chats:
-            self.draw_main(3, bottom, main_x, main_width)
+            self.draw_main(top, bottom, main_x, main_width)
         selected = self.data.get('selected') or {}
         warnings = list(self.data.get('warnings') or []) + list(selected.get('warnings') or [])
         if self.error:
@@ -261,6 +303,55 @@ class _Dashboard:
         help_text += f"  l limits  d decimals ({self.decimals}) · rates = reported batches, not decode speed"
         self.put(height - 1, 1, help_text, curses.A_DIM)
         self.screen.refresh()
+
+    def draw_period(self, height, width, top=3):
+        label = PERIOD_LABELS[self.period_preset]
+        if self.data.get('start') is not None:
+            label += f" · {self.local_minute(self.data['start'])} → {self.local_minute(self.data['end'])} (local)"
+        self.put(top, 1, label, self.color(1) | curses.A_BOLD)
+        if self.data and self.data.get('start') is None:
+            self.put(top + 2, 1, 'Current Codex weekly reset time is unavailable.', self.color(3))
+            self.put(height - 2, 1, 'Esc back · q quit · r refresh', curses.A_DIM)
+            return
+        tokens = self.data.get('tokens') or {}
+        cost = self.data.get('api_cost')
+        self.put(top + 1, 1, f"{len(self.turns()):,} prompts · TOTAL {_number(tokens.get('total_tokens'))} tokens · API USD {_money(cost)}",
+                 curses.A_BOLD)
+        self.put(top + 2, 1, f"Input {_number(tokens.get('input_tokens'))} · Cached {_number(tokens.get('cached_input_tokens'))} · Output {_number(tokens.get('output_tokens'))}")
+        for offset, line in enumerate(_cost_breakdown(cost), top + 3):
+            self.put(offset, 1, line, self.color(2))
+        bottom = height - 3
+        table_top = top + 5
+        if self.detail:
+            self.draw_detail(table_top, bottom, 0, width)
+        else:
+            chat_width = max(8, min(30, width // 5))
+            heading = f"{'PROMPT TIME':11} {'TOKENS':>11} {'API USD':>12}  {'CHAT':{chat_width}}  PROMPT"
+            self.put(table_top, 1, heading, curses.A_DIM)
+            turns = self.turns()
+            first_row = table_top + 1
+            capacity = max(0, bottom - first_row)
+            self.turn_offset = max(0, min(self.turn_offset, self.turn_index))
+            if self.turn_index >= self.turn_offset + capacity:
+                self.turn_offset = max(0, self.turn_index - capacity + 1)
+            self.turn_area = (first_row, bottom, 0, width)
+            for i in range(self.turn_offset, min(len(turns), self.turn_offset + capacity)):
+                turn = turns[i]
+                at = datetime.fromtimestamp(turn['prompt_at']).strftime('%m-%d %H:%M')
+                title = _clip(turn['chat_title'], chat_width)
+                title += ' ' * (chat_width - _width(title))
+                amount = _number(turn['period_tokens']['total_tokens'])
+                money = _money(turn['api_cost_with_children'])
+                self.put(first_row + i - self.turn_offset, 1, f"{at} {amount:>11} {money:>12}  {title}  {_clean(turn['prompt'])}",
+                         curses.A_REVERSE if i == self.turn_index else 0)
+            if not turns:
+                self.put(first_row, 1, 'No recorded prompts in this range.' if self.data else 'Loading time range…')
+        warnings = [self.error] if self.error else self.data.get('warnings') or []
+        self.put(bottom, 1, ' | '.join(warnings) if warnings else
+                 'By prompt start · whole turns and linked agents · API estimate',
+                 self.color(3) if warnings else curses.A_DIM)
+        self.put(height - 2, 1, '↑↓/jk select · Enter detail · Esc back · q quit · r refresh', curses.A_DIM)
+        self.put(height - 1, 1, 'Oldest first · cached tokens are included in input', curses.A_DIM)
 
     def draw_chats(self, top: int, bottom: int, width: int) -> None:
         title = f" CHATS ({len(self.threads)}) " + ('+ agents' if self.include_agents else 'root only')
@@ -300,7 +391,9 @@ class _Dashboard:
         if children is not None:
             self.put(top + 6, x + 1, f"Agent descendants ({selected.get('children_count', '?')}): {_number(children)} tokens (separate DB counters)", curses.A_DIM, width - 2)
         self.put(top + 7, x + 1, f"API USD {_money(selected.get('api_cost_with_children'))} (root {_money(selected.get('api_cost'))} + agents {_money(selected.get('children_api_cost'))}) · Standard token estimate", self.color(2), width - 2)
-        row = top + 9
+        for offset, line in enumerate(_cost_breakdown(selected.get('api_cost_with_children')), 8):
+            self.put(top + offset, x + 1, line, self.color(2), width - 2)
+        row = top + 11
         if getattr(self, 'limits_view', False):
             self.draw_limits(row, bottom, x, width)
         elif self.detail:
@@ -338,9 +431,12 @@ class _Dashboard:
         self.put(top, x + 1, f"TURN DETAIL · {self.turn_index + 1}/{len(turns)} · Esc closes · ↑↓ scroll", self.color(1) | curses.A_BOLD, width - 2)
         lines = [f"{turn.get('status') or 'unknown'} · {_date(turn.get('started_at'))} → {_date(turn.get('ended_at'))} · average OUTPUT {_rate(turn.get('avg_tps'))} tok/s", f"Model: {turn.get('model') or 'unknown'}", f"Total {_number(tokens.get('total_tokens'))} · Input {_number(tokens.get('input_tokens'))} · Output {_number(tokens.get('output_tokens'))}", f"Cached input {_number(tokens.get('cached_input_tokens'))} · Reasoning output {_number(tokens.get('reasoning_output_tokens'))}", f"Usage source: {turn.get('usage_source', 'reported telemetry')}", f"Linked child-agent response tokens (separate): {_number((turn.get('children_tokens') or {}).get('total_tokens', 0))}"]
         cost = turn.get('api_cost') or {}
+        if self.mode == 'time':
+            lines.insert(0, f"Chat: {turn['chat_title']} · {self.local_minute(turn['prompt_at'])}")
         lines += [f"API USD: root {_money(cost)} + linked agents {_money(turn.get('children_api_cost'))} = {_money(turn.get('api_cost_with_children'))}", 'Agent models: ' + (', '.join((turn.get('children_api_cost') or {}).get('models') or []) or 'none recorded'), 'API estimate = current Standard token prices; not subscription billing or internal OpenAI costs.', f"Root cache writes: {_number(tokens.get('cache_write_input_tokens', 0))} (input subset); reasoning already included in output."]
-        parts = cost.get('components_usd') or {}
-        lines += [f"Root USD: uncached {_money({'complete': True, 'usd': parts.get('input')})} · cache read {_money({'complete': True, 'usd': parts.get('cached_input')})}", f"Root USD: cache write {_money({'complete': True, 'usd': parts.get('cache_write')})} · output {_money({'complete': True, 'usd': parts.get('output')})}", f"Root priced calls: {cost.get('calls', 0)} · >272K input calls: {cost.get('long_context_calls', 0)} · unpriced: {cost.get('unpriced_calls', 0)}", f"Rates checked {cost.get('rate_date', 'N/A')} · {cost.get('source', '')}"]
+        lines += ['Combined cost breakdown (root + linked agents):']
+        lines += _cost_breakdown(turn.get('api_cost_with_children'))
+        lines += [f"Root priced calls: {cost.get('calls', 0)} · >272K input calls: {cost.get('long_context_calls', 0)} · unpriced: {cost.get('unpriced_calls', 0)}", f"Rates checked {cost.get('rate_date', 'N/A')} · {cost.get('source', '')}"]
         notes = list((turn.get('api_cost_with_children') or {}).get('notes') or [])
         notes.append(cost.get('exclusions') or 'Separate tool fees and service-tier/regional adjustments excluded.')
         for note in notes:
@@ -400,7 +496,7 @@ class _Dashboard:
             turns = self.turns()
             self.turn_index = max(0, min(self.turn_index + direction, len(turns) - 1))
             if turns:
-                self.turn_id = turns[self.turn_index].get('id')
+                self.turn_id = self.turn_key(turns[self.turn_index])
 
     def mouse(self) -> None:
         try:
@@ -415,7 +511,15 @@ class _Dashboard:
             return
         if not state & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_DOUBLE_CLICKED):
             return
+        for y, x, key, tab, _ in self.view_tabs(self.screen.getmaxyx()[1]):
+            if mouse_y == y and x <= mouse_x < x + len(tab):
+                self.key(key)
+                return
+        if self.mode == 'time' and self.detail:
+            return
         for panel, area in (('chats', self.chat_area), ('history', self.turn_area)):
+            if self.mode == 'time' and panel == 'chats':
+                continue
             top, bottom, left, right = area
             if top <= mouse_y < bottom and left <= mouse_x < right:
                 self.focus = panel
@@ -423,13 +527,16 @@ class _Dashboard:
                     self.select_chat(self.chat_offset + mouse_y - top)
                 elif self.turns():
                     self.turn_index = min(len(self.turns()) - 1, self.turn_offset + mouse_y - top)
-                    self.turn_id = self.turns()[self.turn_index].get('id')
+                    self.turn_id = self.turn_key(self.turns()[self.turn_index])
                     if state & curses.BUTTON1_DOUBLE_CLICKED:
                         self.detail = True
                         self.detail_offset = 0
                 break
 
     def key(self, key: Any) -> bool:
+        if self.range_fields is not None:
+            self.range_key(key)
+            return True
         if self.searching:
             if key in ('\n', '\r', curses.KEY_ENTER):
                 self.searching = False
@@ -445,6 +552,8 @@ class _Dashboard:
             return True
         if key in ('q', 'Q'):
             return False
+        if self.period_navigation(key):
+            return True
         if key == '\t':
             self.focus = 'history' if self.focus == 'chats' else 'chats'
             self.detail = False
@@ -491,7 +600,7 @@ class _Dashboard:
         self.setup()
         while True:
             self.poll_results()
-            if time.monotonic() >= self.next_refresh and not self.searching:
+            if time.monotonic() >= self.next_refresh and not self.searching and self.range_fields is None:
                 self.fetch()
             self.draw(loading=self._loading)
             try:
