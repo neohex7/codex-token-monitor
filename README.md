@@ -70,6 +70,8 @@ CODEX_MONITOR_PYTHON=/path/to/python3 ./start.sh
 | `1` / `2` | Time view: Today or Last 24h |
 | `3` / `4` | Time view: Last 7 days or Last 30 days |
 | `5` | Time view: Since the current Codex weekly reset |
+| `w` | Open recorded weekly periods; Up/Down and Enter select, or click a period |
+| `[` / `]` or Left / Right | In weekly view, select the previous / next recorded cycle |
 | `6` | Edit a custom time range; click or Tab to switch fields, Enter advances/applies, Esc cancels |
 | Up / Down or `j` / `k` | Select a chat or turn |
 | Tab | Switch between chats and turn history |
@@ -86,6 +88,8 @@ CODEX_MONITOR_PYTHON=/path/to/python3 ./start.sh
 A manually selected chat stays selected until follow mode is enabled with `f`. Follow mode uses recorded local activity, not the focused desktop app window. Mouse selection works in terminals with `curses` mouse support. A 156 × 44 terminal is recommended; narrower terminals switch panels with Tab.
 
 Today runs from local midnight to now. Last 24h, Last 7d, and Last 30d roll back from now. Weekly Reset uses the current Codex weekly window's next reset minus the reported window length; it shows unavailable if no current window is known. Custom dates use local time in `YYYY-MM-DD HH:MM` format, with the start included and end excluded. Leave To blank to keep tracking through now. The time view groups by the first user message of each turn and sums the whole turns listed, including linked agents. A turn can finish after the selected range; a turn started before the range is excluded. This is usage attributed to prompts sent in the range, rather than a wall-clock breakdown of individual model calls. Missing or malformed candidate logs are reported, and partial prices show only the known subtotal. The first scan may take several seconds; navigation stays responsive and subsequent refreshes reuse parsed records.
+
+The Periods picker reconstructs weekly cycles from reset timestamps in available local rollout files and the current quota response. It lists the current cycle and older recorded cycles, newest first. A later reset can shorten an earlier cycle; those periods are labeled Early reset. Reset timestamps within five minutes are grouped to tolerate backend countdown drift; distinct resets that close together cannot be resolved by this reconstruction. The current cycle prefers the live endpoint's reset time. Dates are reconstructed from the reported reset and weekly window length, not from repeated observations of 100% remaining. Gaps without recorded resets are not filled with invented cycles. The first history scan runs in the background, and later scans read appended lines only. Press `5` to return to the current cycle.
 
 ## Data and accounting limits
 

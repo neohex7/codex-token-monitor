@@ -30,6 +30,12 @@ class PeriodView:
         self.range_fields = None
         self.range_field = 0
         self.range_error = ''
+        self.weekly_reset = None
+        self.weekly_picker = False
+        self.weekly_periods = []
+        self.weekly_index = 0
+        self.weekly_offset = 0
+        self.weekly_picker_warnings = []
 
     local_minute = staticmethod(local_minute)
 
@@ -56,6 +62,7 @@ class PeriodView:
                 ('3', 'Last 7d', is_time and preset == '7d'),
                 ('4', 'Last 30d', is_time and preset == '30d'),
                 ('5', 'Weekly Reset', is_time and preset == 'weekly'),
+                ('w', 'Periods', self.weekly_picker),
                 ('6', 'Custom', is_time and preset == 'custom')]
         y, x = 2, 1
         for key, label, selected in tabs:
@@ -139,6 +146,20 @@ class PeriodView:
                 self.range_error = ''
 
     def period_navigation(self, key):
+        if key == 'w':
+            if self.data.get('weekly_periods'):
+                self.weekly_periods = self.data['weekly_periods']
+                chosen = self.data.get('weekly_period') or {}
+                self.weekly_index = next((i for i, p in enumerate(self.weekly_periods)
+                                          if p['reset_at'] == chosen.get('reset_at')), 0)
+            self.weekly_picker = True
+            self.next_refresh = 0
+            self.error = ''
+            return True
+        if key == '5':
+            self.weekly_reset = None
+            self.switch_view('time', 'weekly', force=True)
+            return True
         if key == '6':
             self.range_fields = ([local_minute(value) if value is not None else '' for value in self.custom_period]
                                  if self.custom_period else ['', ''])
@@ -150,6 +171,16 @@ class PeriodView:
             return True
         if self.mode != 'time':
             return False
+        if self.period_preset == 'weekly' and not self.detail and key in ('[', ']', curses.KEY_LEFT, curses.KEY_RIGHT):
+            periods = self.data.get('weekly_periods') or []
+            if periods:
+                chosen = self.data.get('weekly_period') or {}
+                index = next((i for i, p in enumerate(periods)
+                              if p['reset_at'] == chosen.get('reset_at')), 0)
+                index = max(0, min(len(periods) - 1,
+                                  index + (1 if key in ('[', curses.KEY_LEFT) else -1)))
+                self.choose_weekly(periods[index])
+            return True
         if key == '\x1b':
             if self.detail:
                 self.detail = False
@@ -166,3 +197,55 @@ class PeriodView:
         elif key == curses.KEY_MOUSE:
             self.mouse()
         return True
+
+    def choose_weekly(self, period):
+        self.weekly_picker = False
+        self.weekly_reset = None if period['current'] else period['reset_at']
+        self.switch_view('time', 'weekly', force=True)
+
+    def weekly_picker_key(self, key):
+        if key == '\x1b':
+            self.weekly_picker = False
+            self.next_refresh = 0
+        elif key in ('\n', '\r', curses.KEY_ENTER):
+            if self.weekly_periods:
+                self.choose_weekly(self.weekly_periods[self.weekly_index])
+        elif key in (curses.KEY_UP, 'k', curses.KEY_DOWN, 'j', curses.KEY_PPAGE, curses.KEY_NPAGE):
+            step = -8 if key == curses.KEY_PPAGE else 8 if key == curses.KEY_NPAGE else (
+                -1 if key in (curses.KEY_UP, 'k') else 1)
+            self.weekly_index = max(0, min(max(0, len(self.weekly_periods) - 1), self.weekly_index + step))
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, x, y, _, state = curses.getmouse()
+            except curses.error:
+                return
+            top, bottom = self.weekly_picker_area
+            if top <= y < bottom and x >= 1 and state & (
+                    curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_DOUBLE_CLICKED):
+                index = self.weekly_offset + y - top
+                if index < len(self.weekly_periods):
+                    self.weekly_index = index
+                    self.choose_weekly(self.weekly_periods[index])
+        elif key == 'r':
+            self.next_refresh = 0
+
+    def draw_weekly_picker(self, top, bottom):
+        self.put(top, 1, 'WEEKLY PERIODS · newest first · Enter or click selects · Esc cancels', curses.A_BOLD)
+        top += 2
+        capacity = max(0, bottom - top)
+        self.weekly_offset = min(self.weekly_offset, self.weekly_index)
+        if self.weekly_index >= self.weekly_offset + capacity:
+            self.weekly_offset = max(0, self.weekly_index - capacity + 1)
+        self.weekly_picker_area = (top, bottom)
+        for i in range(self.weekly_offset, min(len(self.weekly_periods), self.weekly_offset + capacity)):
+            period = self.weekly_periods[i]
+            status = 'Current' if period['current'] else 'Early reset' if period['early_reset'] else 'Previous'
+            label = f"{i + 1:>3}. {self.local_minute(period['start'])} → {self.local_minute(period['end'])} · {status}"
+            self.put(top + i - self.weekly_offset, 1, label,
+                     curses.A_REVERSE if i == self.weekly_index else 0)
+        if not self.weekly_periods:
+            self.put(top, 1, 'Loading recorded weekly periods…' if self._loading else 'No weekly reset history available.')
+        self.put(bottom, 1, self.error or ' | '.join(self.weekly_picker_warnings) or
+                 'Only recorded Codex cycles are listed; gaps in local history are not filled in.',
+                 self.color(3))
+        self.put(bottom + 1, 1, '↑↓/jk select · Enter open · Esc back · r refresh · q quit', curses.A_DIM)

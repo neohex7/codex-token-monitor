@@ -363,6 +363,7 @@ class Monitor:
         self.warnings = []
         self.limit_cache = {}
         self.fallback_scanned = False
+        self.weekly_history = None
 
     def close(self):
         if self.limits_client:
@@ -515,6 +516,31 @@ class Monitor:
             costs.append(unavailable(warning))
         return {'updated_at':time.time(), 'warnings':warnings, 'turns':turns,
                 'start':start, 'end':end, 'tokens':totals, 'api_cost':combine_costs(costs)}
+
+    def weekly_periods(self):
+        from .weekly import WeeklyHistory
+        if self.weekly_history is None:
+            self.weekly_history = WeeklyHistory()
+        rows = self.read_threads()
+        limits = self.recent_limits(rows)
+        periods, warnings = self.weekly_history.periods(
+            [row['rollout_path'] for row in rows], limits, time.time())
+        return {'updated_at':time.time(), 'periods':periods, 'warnings':[*self.warnings, *warnings]}
+
+    def weekly_snapshot(self, reset=None):
+        from .weekly import RESET_TOLERANCE
+        history = self.weekly_periods()
+        selected = next((period for period in history['periods']
+                         if (period['current'] if reset is None else abs(period['reset_at'] - reset) <= RESET_TOLERANCE)), None)
+        if selected is None:
+            warning = 'The selected weekly period is unavailable in local reset history.'
+            return {'updated_at':time.time(), 'start':None, 'end':time.time(), 'turns':[], 'tokens':None,
+                    'api_cost':unavailable(warning), 'warnings':[warning],
+                    'weekly_periods':history['periods']}
+        snapshot = self.period_snapshot(selected['start'], selected['end'])
+        snapshot.update(weekly_period=selected, weekly_periods=history['periods'])
+        snapshot['warnings'].extend(history['warnings'])
+        return snapshot
 
     def recent_limits(self, rows):
         # Read only bounded tails of recently updated rollouts; never rescan whole archives.

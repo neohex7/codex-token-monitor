@@ -181,8 +181,11 @@ class _Dashboard(PeriodView):
             pass
 
     def request_key(self):
+        if self.weekly_picker:
+            return ('weekly_picker',)
         if self.mode == 'time':
-            return ('time', self.period_preset, self.custom_period)
+            return ('time', self.period_preset,
+                    self.weekly_reset if self.period_preset == 'weekly' else self.custom_period)
         return (None if self.follow else self.selected, self.include_agents, self.query, self.follow)
 
     def fetch(self) -> None:
@@ -194,7 +197,11 @@ class _Dashboard(PeriodView):
         self.next_refresh = time.monotonic() + self.refresh
         def load():
             try:
-                if is_time:
+                if request[0] == 'weekly_picker':
+                    data = self.monitor.weekly_periods()
+                elif is_time and request[1] == 'weekly':
+                    data = self.monitor.weekly_snapshot(request[2])
+                elif is_time:
                     data = self.monitor.period_snapshot(*self.period_bounds(request, time.time()))
                 else:
                     data = self.monitor.snapshot(selected_id=request[0], include_agents=request[1], query=request[2])
@@ -222,6 +229,16 @@ class _Dashboard(PeriodView):
             return
         if error:
             self.error = 'Refresh failed: ' + _clean(error)
+            return
+        if self.weekly_picker:
+            previous = (self.weekly_periods[self.weekly_index]['reset_at']
+                        if self.weekly_periods else self.weekly_reset)
+            self.weekly_periods = data['periods']
+            self.weekly_index = next((i for i, p in enumerate(self.weekly_periods)
+                                      if p['reset_at'] == previous), 0)
+            self.weekly_picker_warnings = data['warnings']
+            self.error = ''
+            self.next_refresh = time.monotonic() + self.refresh
             return
         if self.mode == 'chat':
             self.threads = list(data.get('threads') or [])
@@ -273,6 +290,10 @@ class _Dashboard(PeriodView):
             self.draw_range_editor()
             self.screen.refresh()
             return
+        if self.weekly_picker:
+            self.draw_weekly_picker(top, height - 3)
+            self.screen.refresh()
+            return
         if self.mode == 'time':
             self.draw_period(height, width, top)
             self.screen.refresh()
@@ -306,11 +327,15 @@ class _Dashboard(PeriodView):
 
     def draw_period(self, height, width, top=3):
         label = PERIOD_LABELS[self.period_preset]
+        if self.period_preset == 'weekly':
+            selected = self.data.get('weekly_period')
+            if selected:
+                label = 'Current weekly period' if selected['current'] else 'Previous weekly period'
         if self.data.get('start') is not None:
             label += f" · {self.local_minute(self.data['start'])} → {self.local_minute(self.data['end'])} (local)"
         self.put(top, 1, label, self.color(1) | curses.A_BOLD)
         if self.data and self.data.get('start') is None:
-            self.put(top + 2, 1, 'Current Codex weekly reset time is unavailable.', self.color(3))
+            self.put(top + 2, 1, (self.data.get('warnings') or ['Weekly reset time unavailable.'])[0], self.color(3))
             self.put(height - 2, 1, 'Esc back · q quit · r refresh', curses.A_DIM)
             return
         tokens = self.data.get('tokens') or {}
@@ -351,7 +376,9 @@ class _Dashboard(PeriodView):
                  'By prompt start · whole turns and linked agents · API estimate',
                  self.color(3) if warnings else curses.A_DIM)
         self.put(height - 2, 1, '↑↓/jk select · Enter detail · Esc back · q quit · r refresh', curses.A_DIM)
-        self.put(height - 1, 1, 'Oldest first · cached tokens are included in input', curses.A_DIM)
+        hint = '[ / ] or ← / → previous/next week · w selects period' if self.period_preset == 'weekly' else (
+            'Oldest first · cached tokens are included in input')
+        self.put(height - 1, 1, hint, curses.A_DIM)
 
     def draw_chats(self, top: int, bottom: int, width: int) -> None:
         title = f" CHATS ({len(self.threads)}) " + ('+ agents' if self.include_agents else 'root only')
@@ -536,6 +563,11 @@ class _Dashboard(PeriodView):
     def key(self, key: Any) -> bool:
         if self.range_fields is not None:
             self.range_key(key)
+            return True
+        if self.weekly_picker:
+            if key in ('q', 'Q'):
+                return False
+            self.weekly_picker_key(key)
             return True
         if self.searching:
             if key in ('\n', '\r', curses.KEY_ENTER):

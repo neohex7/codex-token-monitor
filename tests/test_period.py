@@ -143,7 +143,7 @@ class PeriodTests(unittest.TestCase):
         self.assertEqual(dashboard.period_bounds(dashboard.request_key(), now), (None, now))
         tabs = list(dashboard.view_tabs(58))
         self.assertEqual(tabs[-1][0], 3)
-        self.assertTrue(tabs[-2][-1])
+        self.assertTrue(next(tab[-1] for tab in tabs if tab[2] == '5'))
 
 
 if __name__ == '__main__':
